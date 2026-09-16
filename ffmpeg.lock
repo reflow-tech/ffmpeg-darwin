@@ -1,0 +1,8 @@
+# The FFmpeg release this repository mirrors.
+#
+# Machine-written by scripts/update-ffmpeg.sh; edit through that script so the
+# checksum never drifts from the version. Every field is read by
+# scripts/build.sh, which verifies the archive against SHA256 before unpacking.
+FFMPEG_VERSION=9.0.1
+FFMPEG_SHA256=cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+FFMPEG_URL=https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz

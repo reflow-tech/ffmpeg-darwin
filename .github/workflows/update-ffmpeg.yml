@@ -1,0 +1,46 @@
+name: update-ffmpeg
+
+# Watches upstream and opens a pull request when a newer release appears.
+# It only moves the lock; the build workflow on that PR is what says whether
+# the new version actually builds, which is the question worth answering
+# before anyone merges.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'FFmpeg version to pin (empty = latest release)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: bump
+        run: |
+          before=$(grep '^FFMPEG_VERSION=' ffmpeg.lock | cut -d= -f2)
+          scripts/update-ffmpeg.sh ${{ inputs.version }}
+          after=$(grep '^FFMPEG_VERSION=' ffmpeg.lock | cut -d= -f2)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          [ "$before" = "$after" ] && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: ffmpeg-${{ steps.bump.outputs.after }}
+          title: 'ffmpeg: ${{ steps.bump.outputs.before }} -> ${{ steps.bump.outputs.after }}'
+          commit-message: 'ffmpeg: ${{ steps.bump.outputs.before }} -> ${{ steps.bump.outputs.after }}'
+          body: |
+            Upstream released FFmpeg ${{ steps.bump.outputs.after }}.
+
+            The lock now carries a SHA256 of the tarball this job downloaded.
+            Before merging, check whether the soname of any dylib moved: a
+            major bump changes what the consuming project links against.

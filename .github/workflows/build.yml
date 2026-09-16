@@ -1,0 +1,103 @@
+name: build
+
+# Tagging is the release. A push to main or a manual run builds and uploads
+# artifacts only, so the expensive part is exercised long before anyone cuts
+# a tag and finds out the toolchain moved under them.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MACOS_DEPLOYMENT_TARGET: '11.0'
+  ZIG_VERSION: '0.16.0'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    # Both architectures build on Apple silicon: the Zig toolchain cross-
+    # compiles either way, so the x86_64 half needs no Intel runner.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install nasm
+        if: matrix.arch == 'x86_64'
+        run: brew install nasm
+
+      - name: Cache the source tarball
+        uses: actions/cache@v4
+        with:
+          path: work/src
+          key: ffmpeg-src-${{ hashFiles('ffmpeg.lock') }}
+
+      - run: scripts/build.sh ${{ matrix.arch }}
+
+      - name: Check the deployment target
+        # The floor is the whole point of this repository, so it is verified
+        # on the built binary rather than trusted from the flags that asked
+        # for it.
+        run: |
+          for lib in build/${{ matrix.arch }}/lib/*.dylib; do
+            [ -L "$lib" ] && continue
+            min=$(otool -l "$lib" | awk '/minos/ {print $2; exit}')
+            echo "$lib -> minos $min"
+            [ "$min" = "${MACOS_DEPLOYMENT_TARGET%.0}" ] || [ "$min" = "$MACOS_DEPLOYMENT_TARGET" ] || {
+              echo "::error::$lib targets $min, expected $MACOS_DEPLOYMENT_TARGET"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  universal:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: ffmpeg-arm64, path: dl/arm64 }
+      - uses: actions/download-artifact@v4
+        with: { name: ffmpeg-x86_64, path: dl/x86_64 }
+
+      - name: Fuse
+        run: |
+          source ffmpeg.lock
+          mkdir -p unpack
+          tar -xzf dl/arm64/ffmpeg-$FFMPEG_VERSION-macos-arm64.tar.gz -C unpack
+          tar -xzf dl/x86_64/ffmpeg-$FFMPEG_VERSION-macos-x86_64.tar.gz -C unpack
+          scripts/universal.sh \
+            "unpack/ffmpeg-$FFMPEG_VERSION-macos-arm64" \
+            "unpack/ffmpeg-$FFMPEG_VERSION-macos-x86_64" \
+            "dist/ffmpeg-$FFMPEG_VERSION-macos-universal2"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-universal2
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dl/arm64/*
+            dl/x86_64/*
+            dist/*
+          generate_release_notes: true
