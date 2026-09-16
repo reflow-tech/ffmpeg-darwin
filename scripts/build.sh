@@ -34,6 +34,9 @@ tools="$root/work/toolchain-$arch"
 rm -rf "$tools"
 MACOS_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" "$root/scripts/toolchain.sh" "$arch" "$tools"
 
+# Expanded as ${asm[@]+...} below: macOS ships bash 3.2, where an empty
+# array under `set -u` is an unbound variable rather than nothing at all,
+# and the arm64 build is the one that has no assembler flag to pass.
 case "$arch" in
   arm64)  ffmpeg_arch=aarch64; asm=() ;;
   x86_64) ffmpeg_arch=x86_64;  asm=(--x86asmexe=nasm) ;;
@@ -54,7 +57,7 @@ cd "$work"
   --ranlib="$tools/ranlib" \
   --extra-cflags="-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}" \
   --extra-ldflags="-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}" \
-  "${asm[@]}" \
+  ${asm[@]+"${asm[@]}"} \
   "${FFMPEG_CONFIGURE_FLAGS[@]}"
 
 make -j"$(sysctl -n hw.ncpu)"
