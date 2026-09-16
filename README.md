@@ -8,9 +8,10 @@ the build.
 
 - **Floor:** macOS 11 Big Sur (`-target <arch>-macos.11`), verified against
   `otool -l` in CI, not just requested in a flag.
-- **Toolchain:** `zig cc` / `zig c++` / `zig ar`, so one runner cross-compiles
-  both architectures and neither depends on the host's Xcode version beyond
-  the SDK's headers and frameworks.
+- **Toolchain:** `zig cc` compiles and Apple's `ld64` links. Zig gives one
+  runner both architectures and a deployment floor carried in the target
+  triple; ld64 is what honours FFmpeg's export lists, which Zig's Mach-O
+  linker ignores. See below.
 - **Licence:** LGPL only. `--disable-gpl --disable-nonfree`, plus Apple's
   AudioToolbox and VideoToolbox.
 - **Libraries:** `avformat`, `avcodec`, `swresample`, `swscale`, `avutil`.
@@ -47,25 +48,31 @@ discovers FFmpeg through `pkg-config` only, and the cgo link uses
 `#cgo pkg-config` for the same libraries. The app bundle is then responsible
 for shipping the dylibs and setting an `LC_RPATH` that finds them.
 
-## Why the toolchain is a set of wrapper scripts
+## Compile with Zig, link with ld64
 
-FFmpeg's darwin build speaks ld64, and Zig's Mach-O linker is stricter in
-ways that each fail the build somewhere non-obvious. `scripts/toolchain.sh`
-writes wrappers that reconcile the two, and every rewrite is recorded there
-with the failure it prevents:
+`scripts/toolchain.sh` writes wrapper scripts that send `-c`/`-S`/`-E` to
+`zig cc` and everything else to Apple's `clang`. The split is not a
+compromise between two tastes; each half does something the other cannot.
 
-- SDK frameworks are included with `-iframework`, or FFmpeg's
-  `-Werror=partial-availability` turns Apple's own headers into errors.
-- The SDK's `/usr/include` and `/usr/lib` are added explicitly; `-isysroot`
-  alone leaves `<libDER/DERItem.h>` and `libobjc.A.dylib` unfindable.
-- `-dynamic` and `-single_module` are dropped, and `-compatibility_version 61`
-  is padded to `61.0.0` — Zig rejects all three.
-- A repeated `-l` is collapsed. FFmpeg names `-lavutil` twice when linking
-  libswresample; ld64 dedupes it, Zig emits two `LC_LOAD_DYLIB` entries, and
-  dyld then refuses to load the result.
+Zig compiles. The target triple is what puts a macOS 11 floor in every
+object, and Zig's own headers and libc are what keep the result the same on
+any machine. Two flags are load-bearing there, both of them Zig meeting
+Apple's SDK: `-iframework`, without which FFmpeg's
+`-Werror=partial-availability` turns Apple's headers into errors (CMTag.h
+declares a macOS 14 symbol), and `-idirafter` on the SDK's `/usr/include`,
+without which Security's `oids.h` cannot find `<libDER/DERItem.h>` and the
+VideoToolbox probe fails.
 
-Stripping is off for the same class of reason: Apple's `strip` cannot read
-what Zig's linker writes, and it runs during `make install`.
+ld64 links, because Zig's Mach-O linker silently ignores
+`-exported_symbols_list`. FFmpeg passes one for every library, and without it
+each dylib exports its internal symbols as well — `___dso_handle` among them,
+which captures a consuming binary's own reference and fails that link with
+`target '___dso_handle' does not have address`. A library nothing can link
+against is not a library, and no flag makes Zig honour the list. Linking
+through ld64 also lets `-single_module`, `-dynamic` and FFmpeg's bare
+`-compatibility_version 61` mean what they were written to mean, and lets
+`strip` read the output during `make install` — with Zig linking, each of
+those needed a workaround, and now none of them does.
 
 ## Building locally
 

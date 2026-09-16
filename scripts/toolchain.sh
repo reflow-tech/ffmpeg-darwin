@@ -1,32 +1,47 @@
 #!/usr/bin/env bash
-# Writes a Zig-backed compiler toolchain into a directory.
+# Writes the toolchain FFmpeg is built with into a directory.
 #
 #   scripts/toolchain.sh <arm64|x86_64> <outdir>
 #
 # FFmpeg's configure wants plain executables it can invoke, not a `zig cc`
-# word pair, so every tool here is a wrapper script. The macOS deployment
-# floor lives in the target triple -- `-macos.11` is what makes the resulting
-# dylibs load on Big Sur -- and the SDK is passed explicitly rather than left
-# to detection, so a runner with several Xcodes installed cannot pick a
-# different one between the configure probes and the build.
+# word pair, so every tool here is a wrapper script.
 #
-# Two of the flags are load-bearing, and both are Zig meeting Apple's SDK:
+# The wrappers compile with Zig and link with Apple's linker, and that split
+# is the whole design:
+#
+#   Compiling is Zig's. The target triple is what puts a macOS 11 floor in
+#   every object -- `-macos.11` is what makes these dylibs load on Big Sur --
+#   and Zig's headers and libc are what keep the build the same on any
+#   machine. The SDK is named explicitly rather than detected, so a runner
+#   with several Xcodes cannot pick a different one between the configure
+#   probes and the build.
+#
+#   Linking is ld64's, because Zig's Mach-O linker silently ignores
+#   -exported_symbols_list. FFmpeg passes one for every library, and without
+#   it each dylib exports its internal symbols as well -- ___dso_handle among
+#   them, which then captures a consuming binary's own reference and fails
+#   its link outright ("target '___dso_handle' does not have address"). A
+#   library nothing can link against is not a library, and no flag makes Zig
+#   honour the list. Linking through ld64 also lets -single_module, -dynamic
+#   and FFmpeg's bare -compatibility_version mean what they were written to
+#   mean, so none of them needs rewriting on the way past.
+#
+# Link mode is anything that is not -c/-S/-E, which is how a compiler driver
+# has always decided it. The objects Zig produced are ordinary Mach-O, so
+# ld64 takes them as they are.
+#
+# Two compile flags are load-bearing, and both are Zig meeting Apple's SDK:
 #
 #   -iframework marks the SDK's frameworks as system headers. Without it,
 #   FFmpeg's -Werror=partial-availability turns Apple's own headers into
 #   build errors -- CMTag.h declaring a macOS 14 symbol is enough to fail a
-#   macOS 11 build. -F stays beside it for the linker's framework search.
+#   macOS 11 build. -F stays beside it for framework search.
 #
 #   -idirafter adds the SDK's /usr/include. Zig ships its own libc headers
 #   and puts them first, which is fine until a framework header reaches for
 #   an SDK-only header beside them -- Security's oids.h including
 #   <libDER/DERItem.h> is the one that breaks the VideoToolbox probe.
 #   Appending it leaves Zig's headers winning every name they define.
-#
-# -L on the SDK's /usr/lib is the link-time half of the same gap: -isysroot
-# does not become a library search root for Zig's linker, so a dylib that
-# links CoreFoundation fails on CoreFoundation.tbd's own dependency --
-# libobjc.A.dylib, which the linker looks for everywhere except the SDK.
 set -euo pipefail
 
 arch="${1:?usage: toolchain.sh <arm64|x86_64> <outdir>}"
@@ -41,99 +56,39 @@ esac
 : "${MACOS_DEPLOYMENT_TARGET:=11.0}"
 : "${ZIG:=zig}"
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
+clang="$(xcrun --find clang)"
+clangxx="$(xcrun --find clang++)"
 triple="${zig_arch}-macos.${MACOS_DEPLOYMENT_TARGET}-none"
 frameworks="$sdk/System/Library/Frameworks"
-sdkflags="-target $triple -isysroot \"$sdk\" -iframework \"$frameworks\" -F\"$frameworks\" -idirafter \"$sdk/usr/include\" -L\"$sdk/usr/lib\""
+
+compile_flags="-target $triple -isysroot \"$sdk\" -iframework \"$frameworks\" -F\"$frameworks\" -idirafter \"$sdk/usr/include\" -L\"$sdk/usr/lib\""
+# ld64 is reached through Apple's clang driver, which needs the two facts the
+# triple carried on the Zig side: which architecture, and which macOS the
+# result has to keep running on.
+link_flags="-arch $arch -mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET -isysroot \"$sdk\""
 
 mkdir -p "$outdir"
 
-# Every compiler wrapper rewrites its own argument list before handing it to
-# Zig, because FFmpeg's darwin link lines speak ld64 and Zig's Mach-O linker
-# is stricter in three places. None of the rewrites change what gets built:
-#
-#   -dynamic and -single_module are ld64 defaults that Zig rejects outright
-#   ("unsupported linker arg"). -dynamic rides on every configure probe that
-#   links, so leaving it in fails checks (videotoolbox among them) that have
-#   nothing to do with linking; -single_module rides on every dylib.
-#
-#   -compatibility_version 61 is a version Zig will not parse: it wants
-#   major.minor.patch, and FFmpeg passes a library's bare major. Padding it
-#   to 61.0.0 records the same version ld64 would have.
-#
-#   A repeated -l is harmless to ld64, which dedupes it, and produces a
-#   broken dylib with Zig, which does not: FFmpeg names -lavutil twice when
-#   linking libswresample, and the result carries two LC_LOAD_DYLIB entries
-#   for it. dyld refuses to load that ("duplicate linked dylib"), so the
-#   library builds and then aborts the first process that opens it. Keeping
-#   only the first occurrence is what ld64 does. Mach-O has no archive
-#   ordering to preserve, so nothing else depends on the repeat.
-#
-# Flags arrive both bare and inside a -Wl, list, so both spellings are
-# handled, and anything sharing that list passes through untouched.
-wrapper_body() {
-  cat <<'BODY'
-pad_version() {
-  case "$1" in
-    *.*.*) printf '%s' "$1" ;;
-    *.*)   printf '%s.0' "$1" ;;
-    *)     printf '%s.0.0' "$1" ;;
-  esac
-}
-
-n=$#
-i=0
-pad_next=0
-seen_libs=" "
-while [ $i -lt $n ]; do
-  a="$1"; shift
-  i=$((i + 1))
-  if [ "$pad_next" = 1 ]; then
-    pad_next=0
-    set -- "$@" "$(pad_version "$a")"
-    continue
-  fi
-  case "$a" in
-    -dynamic|-single_module) ;;
-    -compatibility_version|-current_version)
-      pad_next=1
-      set -- "$@" "$a"
-      ;;
-    -l*)
-      case "$seen_libs" in
-        *" $a "*) ;;
-        *) seen_libs="$seen_libs$a "; set -- "$@" "$a" ;;
-      esac
-      ;;
-    -Wl,*)
-      a=$(printf '%s' "$a" \
-        | sed -E 's/(^|,)-(dynamic|single_module)(,|$)/\1/g; s/,$//' \
-        | awk -F, 'BEGIN{OFS=","} {
-            for (j = 1; j <= NF; j++)
-              if ($j == "-compatibility_version" || $j == "-current_version") {
-                if ($(j+1) !~ /\./) $(j+1) = $(j+1) ".0.0"
-                else if ($(j+1) !~ /\..*\./) $(j+1) = $(j+1) ".0"
-              }
-            print
-          }')
-      [ "$a" = "-Wl" ] || set -- "$@" "$a"
-      ;;
-    *) set -- "$@" "$a" ;;
+emit_driver() { # emit_driver <wrapper name> <zig subcommand> <linker driver>
+  local name="$1" sub="$2" driver="$3"
+  cat > "$outdir/$name" <<WRAPPER
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in
+    -c|-S|-E) exec "$ZIG" $sub $compile_flags "\$@" ;;
   esac
 done
-BODY
-}
-
-emit() { # emit <wrapper name> <zig subcommand> [flags baked into the wrapper]
-  local name="$1" sub="$2" flags="${3:-}"
-  {
-    echo '#!/bin/sh'
-    wrapper_body
-    echo "exec \"$ZIG\" $sub $flags \"\$@\""
-  } > "$outdir/$name"
+exec "$driver" $link_flags "\$@"
+WRAPPER
   chmod +x "$outdir/$name"
 }
 
-emit cc cc "$sdkflags"
-emit c++ c++ "$sdkflags"
-emit ar ar
-emit ranlib ranlib
+emit_zig() { # emit_zig <wrapper name> <zig subcommand>
+  printf '#!/bin/sh\nexec "%s" %s "$@"\n' "$ZIG" "$2" > "$outdir/$1"
+  chmod +x "$outdir/$1"
+}
+
+emit_driver cc cc "$clang"
+emit_driver c++ c++ "$clangxx"
+emit_zig ar ar
+emit_zig ranlib ranlib

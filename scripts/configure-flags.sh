@@ -29,13 +29,6 @@ FFMPEG_CONFIGURE_FLAGS=(
   --disable-avdevice
   --disable-avfilter
 
-  # Apple's strip cannot read what Zig's linker writes ("bad n_sect for
-  # symbol table entry"), and it runs during `make install`, so a stripped
-  # build fails at the last step. The symbols stay; they cost some megabytes
-  # on disk and nothing at runtime, and they are what makes a crash report
-  # from the shipped app readable.
-  --disable-stripping
-
   --enable-pthreads
   --enable-audiotoolbox
   --enable-videotoolbox
